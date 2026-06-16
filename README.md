@@ -19,7 +19,7 @@
 
 ## 示例
 
-![应用示例](docs/images/app-example.png)
+<img src="docs/images/app-example.png" alt="应用示例" width="50%" />
 
 ## 使用说明
 
