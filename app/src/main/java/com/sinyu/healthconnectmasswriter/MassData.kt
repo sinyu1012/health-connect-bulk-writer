@@ -197,9 +197,11 @@ data class MassWriteResult(
 )
 
 class MassHealthConnectWriter(
-    private val client: HealthConnectClient,
+    private val store: HealthConnectDataStore,
     private val factory: MassRecordFactory = MassRecordFactory(),
 ) {
+    constructor(client: HealthConnectClient) : this(AndroidXHealthConnectDataStore(client))
+
     suspend fun write(
         plan: MassDataPlan,
         supportedRecordTypes: Set<KClass<out Record>>,
@@ -227,7 +229,7 @@ class MassHealthConnectWriter(
 
                 val recordName = spec.label
                 try {
-                    client.insertRecords(records)
+                    store.insertRecords(records)
                     doneForSpec += records.size
                     totalInserted += records.size
                     recordCounts[recordName] = (recordCounts[recordName] ?: 0) + records.size
@@ -256,6 +258,73 @@ class MassHealthConnectWriter(
             recordCounts = recordCounts,
             failures = failures,
         )
+    }
+}
+
+data class MassDeleteProgress(
+    val label: String,
+    val typeIndex: Int,
+    val typeCount: Int,
+    val processedTypes: Int,
+    val deletedTypes: Int,
+    val failures: Int,
+)
+
+data class MassDeleteResult(
+    val deletedTypes: Int,
+    val failures: List<String>,
+)
+
+class MassHealthConnectCleaner(
+    private val store: HealthConnectDataStore,
+) {
+    constructor(client: HealthConnectClient) : this(AndroidXHealthConnectDataStore(client))
+
+    suspend fun deleteAppData(
+        supportedRecordTypes: Set<KClass<out Record>>,
+        anchor: Instant = Instant.now(),
+        onProgress: (MassDeleteProgress) -> Unit = {},
+    ): MassDeleteResult {
+        val startTime = anchor.minus(deleteLookback)
+        val endTime = anchor.plus(deleteLookahead)
+        val failures = mutableListOf<String>()
+        var deletedTypes = 0
+
+        supportedRecordTypes.forEachIndexed { index, recordType ->
+            currentCoroutineContext().ensureActive()
+            try {
+                store.deleteRecords(
+                    recordType = recordType,
+                    startTime = startTime,
+                    endTime = endTime,
+                )
+                deletedTypes += 1
+            } catch (t: Throwable) {
+                failures += "${recordType.simpleName}: ${t.message ?: t::class.java.simpleName}"
+            }
+            onProgress(
+                MassDeleteProgress(
+                    label = displayLabel(recordType),
+                    typeIndex = index,
+                    typeCount = supportedRecordTypes.size,
+                    processedTypes = index + 1,
+                    deletedTypes = deletedTypes,
+                    failures = failures.size,
+                )
+            )
+        }
+
+        return MassDeleteResult(deletedTypes = deletedTypes, failures = failures)
+    }
+
+    private fun displayLabel(recordType: KClass<out Record>): String =
+        MassRecordSpecs.allSynthetic.firstOrNull { it.recordType == recordType }?.label
+            ?: recordType.simpleName
+            ?: "未知类型"
+
+    companion object {
+        private val deleteLookback: Duration = Duration.ofDays(3650)
+        private val deleteLookahead: Duration = Duration.ofDays(1)
     }
 }
 

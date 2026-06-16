@@ -32,6 +32,7 @@ class MainActivity : ComponentActivity() {
 
     private val repository by lazy { HealthConnectRepository(this) }
     private val writer by lazy { MassHealthConnectWriter(repository.client) }
+    private val cleaner by lazy { MassHealthConnectCleaner(repository.client) }
     private val profiles = listOf(
         Profile("核心压测", MassRecordSpecs.default),
         Profile("全类型模拟", MassRecordSpecs.allSynthetic),
@@ -52,6 +53,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var refreshButton: Button
     private lateinit var openButton: Button
     private lateinit var startButton: Button
+    private lateinit var deleteButton: Button
     private lateinit var cancelButton: Button
 
     private var writeJob: Job? = null
@@ -142,12 +144,15 @@ class MainActivity : ComponentActivity() {
         refreshButton = button("刷新") { refreshState() }
         openButton = button("打开 HC") { repository.openHealthConnect() }
         startButton = button("开始写入") { startWriting() }
+        deleteButton = button("删除已写入数据") { startDeleting() }
         cancelButton = button("取消") { writeJob?.cancel() }
+        deleteButton.isEnabled = false
         cancelButton.isEnabled = false
 
         content.addView(buttonRow(installButton, permissionButton))
         content.addView(buttonRow(refreshButton, openButton))
         content.addView(startButton)
+        content.addView(deleteButton)
         content.addView(cancelButton)
         content.addView(progressBar)
         content.addView(progressText)
@@ -165,6 +170,7 @@ class MainActivity : ComponentActivity() {
                 permissionButton.isEnabled = false
                 openButton.isEnabled = false
                 startButton.isEnabled = false
+                deleteButton.isEnabled = false
                 cancelButton.isEnabled = writeJob != null
                 return@launch
             }
@@ -184,6 +190,7 @@ class MainActivity : ComponentActivity() {
             permissionText.text = buildPermissionStatusText(granted, total, missing, missingWrite)
             permissionButton.isEnabled = missing.isNotEmpty() && writeJob == null
             startButton.isEnabled = missingWrite.isEmpty() && writeJob == null
+            deleteButton.isEnabled = writeJob == null
             cancelButton.isEnabled = writeJob != null
         }
     }
@@ -248,6 +255,50 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun startDeleting() {
+        if (writeJob != null) return
+        if (!repository.isAvailable()) {
+            repository.installHealthConnect()
+            return
+        }
+
+        writeJob = lifecycleScope.launch {
+            val supportedTypes = repository.supportedRecordTypes()
+            val grantedPermissions = repository.grantedPermissions()
+            val missingWrite = HealthConnectCatalog.writePermissionsFor(supportedTypes)
+                .filterNotTo(linkedSetOf()) { it in grantedPermissions }
+            if (missingWrite.isNotEmpty()) {
+                resultText.text = "缺少删除所需写入权限：${formatPermissions(missingWrite)}"
+                permissionLauncher.launch(repository.allRuntimePermissions())
+                writeJob = null
+                return@launch
+            }
+
+            setRunning(true)
+            progressBar.progress = 0
+            progressText.text = "准备删除本应用写入的数据..."
+            resultText.text = ""
+
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    cleaner.deleteAppData(supportedRecordTypes = supportedTypes) { progress ->
+                        runOnUiThread { showDeleteProgress(progress) }
+                    }
+                }
+                progressBar.progress = 1000
+                resultText.text = buildDeleteResultText(result)
+            } catch (_: CancellationException) {
+                resultText.text = "已取消"
+            } catch (t: Throwable) {
+                resultText.text = "删除失败：${t.message ?: t::class.java.simpleName}"
+            } finally {
+                writeJob = null
+                setRunning(false)
+                refreshState()
+            }
+        }
+    }
+
     private fun selectedPlan(): MassDataPlan {
         val profile = profiles[profileSpinner.selectedItemPosition.coerceAtLeast(0)]
         val heartRateCount = scales[scaleSpinner.selectedItemPosition.coerceAtLeast(0)]
@@ -285,6 +336,15 @@ class MainActivity : ComponentActivity() {
             "合计 ${formatCount(progress.totalInserted)} / ${formatCount(progress.totalPlanned)}"
     }
 
+    private fun showDeleteProgress(progress: MassDeleteProgress) {
+        val ratio = if (progress.typeCount == 0) 0.0 else {
+            progress.processedTypes.toDouble() / progress.typeCount.toDouble()
+        }
+        progressBar.progress = (ratio.coerceIn(0.0, 1.0) * 1000).toInt()
+        progressText.text = "[${progress.typeIndex + 1}/${progress.typeCount}] 删除 ${progress.label} · " +
+            "成功 ${progress.deletedTypes}，失败 ${progress.failures}"
+    }
+
     private fun buildResultText(result: MassWriteResult): String {
         val counts = result.recordCounts.entries.joinToString(separator = "\n") {
             "${it.key}: ${formatCount(it.value)}"
@@ -295,6 +355,15 @@ class MainActivity : ComponentActivity() {
             "\n跳过/失败：\n${result.failures.joinToString(separator = "\n")}"
         }
         return "已写入 ${formatCount(result.totalInserted)} 条\n$counts$failures"
+    }
+
+    private fun buildDeleteResultText(result: MassDeleteResult): String {
+        val failures = if (result.failures.isEmpty()) {
+            ""
+        } else {
+            "\n跳过/失败：\n${result.failures.joinToString(separator = "\n")}"
+        }
+        return "已请求删除本应用写入数据：${result.deletedTypes} 种类型$failures"
     }
 
     private fun buildPermissionStatusText(
@@ -325,6 +394,7 @@ class MainActivity : ComponentActivity() {
         refreshButton.isEnabled = !running
         openButton.isEnabled = !running
         startButton.isEnabled = !running
+        deleteButton.isEnabled = !running
         cancelButton.isEnabled = running
     }
 
